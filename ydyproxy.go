@@ -10,7 +10,6 @@ import (
     "runtime"
     "bufio"
     "strings"
-    "strconv"
     "crypto/md5"
     "time"
     "sync"
@@ -138,41 +137,6 @@ func DisconnectMecachedConn(driver_map *[]Driver){
             driver.Close()
         }
     }
-}
-
-
-func Read(r *bufio.Reader, des *[]byte, bytes_length_string string, af int)(error){
-
-    bytes_length, err := strconv.Atoi( bytes_length_string )
-    if err!=nil{
-        return err
-    }
-
-
-/*
-    read_data, err := ioutil.ReadAll(io.LimitReader(r, int64(bytes_length) ))
-    if err==nil {
-        for _,b := range read_data{
-            *des = append(*des, b)
-        }
-    }else{
-        return err
-    }
-*/
-
-    var _b []byte
-    read_data := make([]byte, bytes_length )
-    if _, err := r.Read(read_data); err==nil{
-        for _,b := range read_data{
-            *des = append(*des, b)
-        }
-        r.Read(_b)
-        fmt.Println(_b)
-    }else{
-        return err
-    }
-    
-    return nil
 }
 
 func Write(c Driver, data... []byte)(err error){
