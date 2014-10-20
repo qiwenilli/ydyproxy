@@ -1,325 +1,405 @@
 /**
-change log 2014-08-10 16:24:00
-
+change log 1.0 2014-08-10 16:24
+change log 1.1 2014-08-27 16:40
+change log 1.2 2014-09-12 12:58
+change log 1.3 2014-09-17 17:39 add "gets" command support
 */
+
 package main
 
 import (
-    "fmt"
-    "net"
-    "runtime"
-    "bufio"
-    "strings"
-    "crypto/md5"
-    "time"
-    "sync"
-    "flag"
-    "os"
-    "errors"
-    "io"
-    "io/ioutil"
+	"bufio"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"net"
+	"os"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	//    "time"
+	//    "crypto/md5"
 )
 
+var lock = &sync.Mutex{}
 
-var version = `
-ydyproxy 1.0 is a memcahced proxy, Copyright (c) 2014 Qiwen<34214399@qq.com>
+var (
+	version = `
+ydyproxy 1.3 is a memcahced proxy, Copyright (c) 2014 Qiwen<34214399@qq.com>
 All rights reserved. GPL-3.0
 `
+	master_ip_map []string //{"127.0.0.1:11221","127.0.0.1:11222"}
+	backup_ip_map []string //{"127.0.0.1:11223"}
 
-var lock sync.Mutex
+	crlf                  = []byte("\r\n")
+	end                   = []byte("END\r\n")
+	memcached_error       = []byte("ERROR\r\n")
 
-const(
-    TIMEOUT = time.Millisecond*20
+	vv = new(bool)
+
+	ERR_NOTCONNECT = errors.New("memcahced invalid")
+	ERR_COMMAND    = errors.New("command invalid")
 )
 
-type Driver net.Conn
-
-var master_ip_map []string
-var backup_ip_map []string
-
-
-type Item struct{
-    Cmd string
-    Key string
-    Flags uint32
-    Exptime uint32
-    Bytes uint32
+type Driver struct {
+	Conn net.Conn
+	W    *bufio.Writer
+	R    *bufio.Reader
 }
 
-var(
-    crlf = []byte("\r\n")
-    space = []byte(" ")
+func main() {
 
-    patterns = map[string]string{
-        "add":"add %s %d %d %d",
-        "set":"set %s %d %d %d",
-        "replace":"replace %s %d %d %d",
-        "get":"get %s",
-        "delete":"delete %s",
-        "quit":"quit",
-        "VALUE":"VALUE %s %d %d",
-    }
+	fmt.Println("cpus =", runtime.NumCPU())
 
-    vv = new(bool)
-)
+	_p := flag.String("p", "11221", "port, default is 11211. (0 to disable tcp support)")
+	_s := flag.String("s", "", "ip:port,ip:port... (master group)")
+	_b := flag.String("b", "", "ip:port,ip:port... (backup group)")
+	_c := flag.Int("c", runtime.NumCPU()/2, "The total number of threads; default numcpu/2")
+	_d := flag.Bool("D", false, "don't go to background")
+	_v := flag.Bool("v", false, "verbose")
+	_h := flag.Bool("h", false, "help")
+	flag.Parse()
 
+	*vv = *_v
 
-func main(){
+	if *_h == true || *_s == "" {
+		flag.Usage()
+		fmt.Println(version)
+		os.Exit(0)
+	}
+	if *_c > runtime.NumCPU() {
+		*_c = runtime.NumCPU()
+	} else if *_c < 1 {
+		*_c = 1
+	}
+	runtime.GOMAXPROCS(*_c)
 
-    fmt.Println( "cpus =", runtime.NumCPU() )
+	//fmt.Println( *_p, *_s, *_b, *_v, *_h, *_c )
 
-    _p := flag.String("p","11221","port, default is 11211. (0 to disable tcp support)")
-    _s := flag.String("s","","ip:port,ip:port... (master group)")
-    _b := flag.String("b","","ip:port,ip:port... (backup group)")
-    _c := flag.Int("c",runtime.NumCPU()/2, "The total number of threads; default numcpu/2")
-    _v := flag.Bool("v",false,"verbose")
-    _h := flag.Bool("h",false,"help")
-    flag.Parse()
+	master_ip_map = strings.Split(*_s, ",")
+	backup_ip_map = strings.Split(*_b, ",")
 
-    *vv = *_v
+	defer fmt.Println("ydyproxy exit")
 
-    if *_h == true || *_s=="" {
-        flag.Usage()
-        fmt.Println( version )
-        os.Exit(0)
-    }
-    if *_c>runtime.NumCPU(){
-        *_c=runtime.NumCPU()
-    }else if *_c<1 {
-        *_c=1
-    }
-    runtime.GOMAXPROCS( *_c )
+	if *_d == true && daemon(0, 0) == -1 {
+		fmt.Println("failed to be a daemon")
+		os.Exit(0)
+	}
 
-    //fmt.Println( *_p, *_s, *_b, *_v, *_h, *_c )
+	//
+	l, err := net.Listen("tcp", ":"+*_p)
+	if err != nil {
+		fmt.Printf("Failure to listen: %s\n", err.Error())
+		panic(err)
+	}
 
-    master_ip_map = strings.Split(*_s,",")
-    backup_ip_map = strings.Split(*_b,",")
+	for {
 
-    defer fmt.Println("ydyproxy exit")
-
-    if l, err := net.Listen("tcp", ":"+*_p); err==nil{
-        for{
-            if c,err := l.Accept(); err==nil{
-                lock.Lock()
-                go process(c)
-            }
-        }
-    }else{
-        fmt.Println(err)
-    }
+		if c, err := l.Accept(); err == nil {
+			go process(c)
+		} else {
+			fmt.Println("accept error", err)
+		}
+	}
 }
 
-func CheckErr(tag string, err error)(error){
+func process(c net.Conn) {
 
-    if err==nil{
-        return nil
-    }else{
-        if *vv==true {
-            fmt.Println("tag:"+tag, err)
-        }
-        return err
-    }
+	//
+	s := &Driver{Conn: c, W: bufio.NewWriter(c), R: bufio.NewReader(c)}
+	defer c.Close()
+
+	master_client := connect_memcached(master_ip_map)
+	backup_client := connect_memcached(backup_ip_map)
+
+	for {
+		line, err := s.R.ReadSlice('\n')
+		if err != nil {
+			goto END
+		}
+
+		cmd_string := string(line[0 : len(line)-2])
+		debug(fmt.Sprintf("\t|||source--> %s } ", cmd_string), nil)
+
+		//
+		cmd_list, request_data, err := get_request_body(s, line)
+		if err != nil {
+			debug("ERR>"+fmt.Sprintf("%q", err), nil)
+			goto END
+		}
+
+		if cmd_list[0] == "gets" {
+			var response_data []byte
+			for i := 1; i < len(cmd_list); i++ {
+				get := fmt.Sprintf("get %s \r\n", cmd_list[i])
+				get_byte := []byte(get)
+				get_list := strings.Fields(get)
+				d, err := driver_memcached(master_client, backup_client, &get_byte, &get_list)
+
+				if err == nil {
+					for _, b := range d[0 : len(d)-5] {
+						response_data = append(response_data, b)
+					}
+				} else {
+					goto END
+				}
+			}
+			response_data = append(response_data, 69, 78, 68, 13, 10)
+			if _, err := s.Conn.Write(response_data); err != nil {
+				goto END
+			}
+		} else {
+			d, err := driver_memcached(master_client, backup_client, &request_data, &cmd_list)
+			if err == nil {
+				if _, err := s.Conn.Write(d); err != nil {
+					goto END
+				}
+			} else {
+				goto END
+			}
+		}
+	}
+
+	disconnect_memcached(master_client)
+	disconnect_memcached(backup_client)
+
+	return
+END:
+	s.Conn.Write(memcached_error)
+
+	//
+	disconnect_memcached(master_client)
+	disconnect_memcached(backup_client)
 }
 
-func ConnectMecachedConn(driver_map *[]Driver,ips []string){
-    for _,ip := range ips{
-        if _m, err := net.DialTimeout("tcp", ip, TIMEOUT); err==nil{
-            *driver_map = append(*driver_map, _m) 
-        }else{
-            *driver_map = append(*driver_map, nil) 
-        }
-    }
+func connect_memcached(ips []string) []*Driver {
+	var connect_server []*Driver
+	for _, ip := range ips {
+		if c, err := net.Dial("tcp", ip); err == nil {
+			d := &Driver{Conn: c, W: bufio.NewWriter(c), R: bufio.NewReader(c)}
+			connect_server = append(connect_server, d)
+		} else {
+			connect_server = append(connect_server, nil)
+			debug("connect>"+ip+" "+fmt.Sprintf("%s", err), nil)
+		}
+	}
+	return connect_server
 }
 
-func DisconnectMecachedConn(driver_map *[]Driver){
-    for _,driver := range *driver_map{
-        if driver!=nil{
-            driver.Close()
-        }
-    }
+func disconnect_memcached(drivers []*Driver) {
+	for _, d := range drivers {
+		if d != nil {
+			d.Conn.Close()
+		}
+	}
 }
 
-func Write(c Driver, data... []byte)(err error){
+func get_request_body(s *Driver, cmd []byte) ([]string, []byte, error) {
 
-    w := bufio.NewWriter(c)
+	cmd_string := fmt.Sprintf("%s", cmd)
 
-    for _, _byte := range data{
-        _, err = w.Write( _byte )
-        if CheckErr("memcahced write data", err)!=nil{
-            return err
-        }
-    }   
+	cmd_list := strings.Fields(cmd_string)
 
-    err = w.Flush()
-    if CheckErr("memcahced flush ", err)!=nil{
-        return err
-    }
+	//check command support
+	if cmd_list[0] != "get" && cmd_list[0] != "gets" && cmd_list[0] != "add" && cmd_list[0] != "set" && cmd_list[0] != "delete" && cmd_list[0] != "replace" {
+		return nil, nil, errors.New(cmd_string + " nonsupport")
+	}
 
-    return nil
+	//
+	if len(cmd_list) > 1 {
+		var request_body []byte
+		if cmd_list[0] != "get" && cmd_list[0] != "gets" && len(cmd_list) > 3 {
+			request_len, err := strconv.Atoi(cmd_list[4])
+			if err != nil {
+				return nil, nil, err
+			}
+			_request_body, err := ioutil.ReadAll(io.LimitReader(s.R, int64(request_len+2)))
+			if err != nil {
+				return nil, nil, err
+			}
+			request_body = _request_body
+		}
+		request_data := make([]byte, len(cmd)+len(request_body))
+		copy(request_data, []byte(cmd_string))
+		copy(request_data[len(cmd):], request_body)
+		//
+		return cmd_list, request_data, nil
+	}
+	return cmd_list, cmd, ERR_COMMAND
 }
 
-func ReadCallBack(c Driver)([]byte, error){
-    cr := bufio.NewReader(c)
+func get_response_body(m *Driver, cmd []byte) ([]byte, error) {
 
-    command,_,err := cr.ReadLine()
-    if err!=nil{
-        return nil,err
-    }
+	cmd_string := fmt.Sprintf("%s", cmd)
 
-    line := fmt.Sprintf("%s", command)
+	cmd_list := strings.Fields(cmd_string)
 
-    //
-    item := new(Item)
-    _, err = scanGetResponseLine(line, item)
-
-
-    //
-    data_body := []byte(line+"\r\n")
-    if err!=nil{
-        return data_body, nil
-    }
-
-    //
-    read_data, err := ioutil.ReadAll(io.LimitReader(cr, int64(item.Bytes)+7))
-    if err!=nil{
-        return nil, err
-    }
-
-    for _,b := range read_data {
-        data_body = append(data_body, b)
-    }
-
-    return data_body, nil
+	//
+	if len(cmd_list) > 1 && cmd_list[0] == "VALUE" {
+		response_len, _ := strconv.Atoi(cmd_list[3])
+		response_body, err := ioutil.ReadAll(io.LimitReader(m.R, int64(response_len+7)))
+		//
+		if err != nil {
+			return nil, err
+		}
+		response_data := make([]byte, len(cmd)+len(response_body))
+		copy(response_data, []byte(cmd_string))
+		copy(response_data[len(cmd):], response_body)
+		//
+		return response_data, nil
+	}
+	return cmd, nil
 }
 
+func driver_memcached(master_client, backup_client []*Driver, request_data *[]byte, cmd_list *[]string) ([]byte, error) {
 
-func Getmd5(str string,ips []string) int{
-    h := md5.New()
-    h.Write([]byte(str)) // 需要加密的字符串为 123456
+	master_index, backup_index := getindex(&((*cmd_list)[1]), len(master_ip_map)), getindex(&(*cmd_list)[1], len(backup_ip_map))
+	master_ip, backup_ip := master_ip_map[master_index], backup_ip_map[backup_index]
+	master_driver, backup_driver := master_client[master_index], backup_client[backup_index]
 
-    md5int := h.Sum(nil)
+	cmd_string := strings.Join(*cmd_list, " ")
 
-    return int(md5int[0])%len(ips)
+	//write master
+	response_data, err := write_memcached(master_driver, request_data)
+	if err == nil {
+		debug("M>"+master_ip+" "+cmd_string, nil)
+		//
+		if (*cmd_list)[0] != "get" {
+			debug("B>"+backup_ip+" "+cmd_string, nil)
+			write_memcached(backup_driver, request_data)
+		}
+		//
+		return response_data, err
+	} else if (*cmd_list)[0] == "get" {
+		//write backup
+		debug("B>"+backup_ip+" "+cmd_string, nil)
+		response_data, err := write_memcached(backup_driver, request_data)
+		if err == nil {
+			return response_data, err
+		}
+	}
+	return nil, ERR_COMMAND
 }
 
+func write_memcached(m *Driver, request_data *[]byte) ([]byte, error) {
 
-func scanGetResponseLine(line string, it *Item)(string, error){
+	if m == nil {
+		return nil, ERR_NOTCONNECT
+	}
+	if _, err := m.W.Write(*request_data); err != nil {
+		return nil, err
+	}
+	if err := m.W.Flush(); err != nil {
+		return nil, err
+	}
 
-    command := strings.Fields(line)
+	response_command, err := m.R.ReadSlice('\n')
+	if err != nil {
+		return nil, err
+	}
 
-//    dest := []interface{}{ &it.Key, &it.Flags, &it.Exptime, &it.Bytes }
-//    if len(command)==0{
-//        dest = []interface{}{}
-//    }else{
-//        dest = dest[:len(command)-1]
-//    } 
-
-
-    dest := []interface{}{}
-    switch len(command){
-    case 2:
-        dest = []interface{}{ &it.Key }
-    case 4:
-        dest = []interface{}{ &it.Key, &it.Flags, &it.Bytes }
-    case 5:
-        dest = []interface{}{ &it.Key, &it.Flags, &it.Exptime, &it.Bytes }
-    }
-
-
-    for k,v := range patterns{
-        _, err := fmt.Sscanf( line, v, dest...  )
-        if err==nil {
-            return k, nil
-        }
-    }
-
-    return "",errors.New("not command") 
+	return get_response_body(m, response_command)
 }
 
+func getindex(str *string, num int) int {
 
-func process(c net.Conn){
+	return hashme(str) % num
 
-    var master_driver_map []Driver
-    ConnectMecachedConn(&master_driver_map, master_ip_map)
+	//
+	/*
+	   h := md5.New()
+	   h.Write([]byte(str)) // 需要加密的字符串为 123456
 
-    var backup_driver_map []Driver
-    ConnectMecachedConn(&backup_driver_map, backup_ip_map)
+	   md5int := h.Sum(nil)
 
-    sr := bufio.NewReader(c)
-    for{
-        command,_,err := sr.ReadLine()
-        if CheckErr("request read line", err)!=nil {
-            break
-        }
-        command_string := fmt.Sprintf("%s", command)
-
-//        fmt.Println( command_string )
-        //
-        item := new(Item)
-        command_name, err := scanGetResponseLine(command_string, item)
-        if CheckErr("command err", err)!=nil{
-            continue
-        }
-
-        //count
-        master_index := Getmd5(item.Key, master_ip_map)
-        backup_index := Getmd5(item.Key, backup_ip_map)
-
-        master_client := master_driver_map[master_index]
-        backup_client := backup_driver_map[backup_index]
-
-        //
-        var data_body []byte
-        switch command_name {
-        case "set","add","replace":
-        //,"append","prepend","cas":
-            read_data, err := ioutil.ReadAll(io.LimitReader(sr, int64(item.Bytes+2) ))
-            if err!=nil{
-                continue
-            }
-            data_body = read_data
-            //
-            if master_client!=nil{
-                CheckErr("request master ", errors.New(master_ip_map[master_index]+"\t"+command_string ) )
-                CheckErr("\trquest backup ", errors.New(backup_ip_map[backup_index]+"\t"+command_string ) )
-                Write(backup_client, command, crlf, data_body ) 
-            }
-        default:
-            if master_client==nil{
-                //if master invalid; read backup
-                CheckErr("only read;change backup ", errors.New(backup_ip_map[backup_index]+"\t"+command_string ) )
-                master_client = backup_client
-            }else{
-                CheckErr("request master ", errors.New(master_ip_map[master_index]+"\t"+command_string ) )
-            }
-        }
-
-        //if backupup don't connected
-        if master_client==nil{
-            break
-        }
-        
-        if Write(master_client, command, crlf, data_body )!=nil{
-            continue
-        }  
-
-        //request memcahced callback data
-        callback_data, err := ReadCallBack(master_client)
-        if( err!=nil ){
-            continue
-        }
-
-        if Write(c, callback_data)!=nil{
-            continue
-        }
-
-    }
-
-    DisconnectMecachedConn(&master_driver_map)
-    DisconnectMecachedConn(&backup_driver_map)
-
-    c.Close()
-
-    lock.Unlock()
+	   return int(md5int[0]+md5int[1]+md5int[2])%num
+	*/
 }
 
+func hashme(str *string) int {
+
+	if str == nil {
+		return 0
+	}
+
+	hash := 5381
+	for _, b := range *str {
+		hash = ((hash << 5) + hash) + int(byte(b))
+
+	}
+	hash &= 0x7FFFFFFF
+	return hash
+}
+
+func daemon(nochdir, noclose int) int {
+	var ret, ret2 uintptr
+	var err syscall.Errno
+
+	darwin := runtime.GOOS == "darwin"
+
+	// already a daemon
+	if syscall.Getppid() == 1 {
+		return 0
+	}
+
+	// fork off the parent process
+	ret, ret2, err = syscall.RawSyscall(syscall.SYS_FORK, 0, 0, 0)
+	if err != 0 {
+		return -1
+	}
+
+	// failure
+	if ret2 < 0 {
+		os.Exit(-1)
+	}
+
+	// handle exception for darwin
+	if darwin && ret2 == 1 {
+		ret = 0
+	}
+
+	// if we got a good PID, then we call exit the parent process.
+	if ret > 0 {
+		os.Exit(0)
+	}
+
+	/* Change the file mode mask */
+	_ = syscall.Umask(0)
+
+	// create a new SID for the child process
+	s_ret, s_errno := syscall.Setsid()
+	if s_errno != nil {
+		fmt.Printf("Error: syscall.Setsid errno: %d", s_errno)
+
+	}
+	if s_ret < 0 {
+		return -1
+	}
+
+	if nochdir == 0 {
+		os.Chdir("/")
+	}
+
+	if noclose == 0 {
+		f, e := os.OpenFile("/dev/null", os.O_RDWR, 0)
+		if e == nil {
+			fd := f.Fd()
+			syscall.Dup2(int(fd), int(os.Stdin.Fd()))
+			syscall.Dup2(int(fd), int(os.Stdout.Fd()))
+			syscall.Dup2(int(fd), int(os.Stderr.Fd()))
+
+		}
+
+	}
+	return 0
+}
+
+func debug(msg string, err error) {
+	if *vv == true {
+		fmt.Println(msg, err)
+	}
+}
